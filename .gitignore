@@ -1,0 +1,5 @@
+**/data/
+**/best_deeplab.pth
+**/masks/
+**/images/
+**/predictions/
