@@ -7,6 +7,7 @@ import numpy as np
 import time
 import threading
 import queue
+import logging
 
 import torchvision.transforms as T
 from torch.cuda.amp import autocast
@@ -18,6 +19,19 @@ from segmentation_models_pytorch import DeepLabV3Plus
 BATCH_SIZE        = 2          # Pradinis batch size; pakoreguok pagal savo VRAM
 DOWNSCALE_FACTOR  = 1          # 1 = originali rezoliucija; 2 = pusė, 4 = ketvirtadalis
 QUEUE_SIZE        = 32         # kiek kadrų iš anksto pakrauti
+LOG_FILE          = 'process_video.log'
+
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode='w',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 torch.backends.cudnn.benchmark = True
 
 # -----------------------------------------------------------------------------
@@ -35,7 +49,7 @@ output_dir  = os.path.join(BASE_DIR, 'predictions', 'output')
 threshold   = 0.5
 
 # -----------------------------------------------------------------------------
-# Utility
+# Utility functions
 # -----------------------------------------------------------------------------
 def format_time(seconds):
     s = int(seconds)
@@ -68,6 +82,21 @@ def pad_to_divisible(frame, d=16):
     f  = cv2.copyMakeBorder(frame, 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=(0,0,0))
     return f, h, w
 
+
+def detect_and_draw_lines(frame, mask_binary):
+    # Canny edge detection on mask
+    edges = cv2.Canny(mask_binary, 50, 150)
+    # Hough line transform
+    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi/180, threshold=30,
+                            minLineLength=40, maxLineGap=20)
+    detected = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            detected.append((x1, y1, x2, y2))
+    return frame, detected
+
 # -----------------------------------------------------------------------------
 # Frame reader thread
 # -----------------------------------------------------------------------------
@@ -80,9 +109,9 @@ def frame_reader(cap, q):
     q.put(None)
 
 # -----------------------------------------------------------------------------
-# Batch inference + write
+# Batch inference + draw & log
 # -----------------------------------------------------------------------------
-def process_batch(batch_frames, batch_meta, model, device, writer):
+def process_batch(batch_frames, batch_meta, model, device, writer, frame_idx_start):
     inp = torch.stack(batch_frames).to(device)
     with torch.no_grad(), autocast():
         masks = model(inp)            # [B,1,H,W]
@@ -90,10 +119,21 @@ def process_batch(batch_frames, batch_meta, model, device, writer):
 
     for i in range(len(batch_frames)):
         h0, w0, frame = batch_meta[i]
-        mask_np = (probs[i,0,:h0,:w0].cpu().numpy().astype(np.uint8) * 255)
-        m_bgr   = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
+        prob = probs[i,0,:h0,:w0].cpu().numpy()
+        mask_np = (prob > threshold).astype(np.uint8) * 255
+        # Overlay mask
+        m_bgr = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
         overlay = cv2.addWeighted(frame, 0.7, m_bgr, 0.3, 0)
-        writer.write(overlay)
+        # Detect lines
+        frame_with_lines, lines = detect_and_draw_lines(overlay, mask_np)
+        # Log detected lines
+        frame_num = frame_idx_start + i + 1
+        if lines:
+            for ln in lines:
+                logger.info(f"Frame {frame_num}: linija {ln}")
+        else:
+            logger.info(f"Frame {frame_num}: nenustatytos linijos")
+        writer.write(frame_with_lines)
 
 # -----------------------------------------------------------------------------
 # Single-video processing
@@ -115,6 +155,7 @@ def process_single_video(in_path, out_path, model, device):
                              cv2.VideoWriter_fourcc(*'mp4v'),
                              fps, (width, height))
 
+    logger.info(f"Pradėtas apdorojimas: {os.path.basename(in_path)}, total frames: {total}")
     # start reader
     q = queue.Queue(maxsize=QUEUE_SIZE)
     t = threading.Thread(target=frame_reader, args=(cap, q), daemon=True)
@@ -137,7 +178,7 @@ def process_single_video(in_path, out_path, model, device):
         if frame is None:
             # galutinis batch
             if batch_frames:
-                process_batch(batch_frames, batch_meta, model, device, writer)
+                process_batch(batch_frames, batch_meta, model, device, writer, idx)
                 idx += len(batch_frames)
             break
 
@@ -150,7 +191,7 @@ def process_single_video(in_path, out_path, model, device):
         batch_meta.append((h0, w0, frame))
 
         if len(batch_frames) == BATCH_SIZE:
-            process_batch(batch_frames, batch_meta, model, device, writer)
+            process_batch(batch_frames, batch_meta, model, device, writer, idx)
             idx += BATCH_SIZE
             batch_frames.clear()
             batch_meta.clear()
@@ -171,6 +212,7 @@ def process_single_video(in_path, out_path, model, device):
     cap.release()
     writer.release()
     total_t = time.time() - start
+    logger.info(f"Baigta apdorojimas per {format_time(total_t)}")
     print(f"\n✅ {os.path.basename(in_path)} baigėsi per {format_time(total_t)}")
 
 # -----------------------------------------------------------------------------
